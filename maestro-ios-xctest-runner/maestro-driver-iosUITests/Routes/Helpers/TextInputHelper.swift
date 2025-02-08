@@ -8,32 +8,41 @@ struct TextInputHelper {
     )
     
     private enum Constants {
-        static let typingFrequency = 30
-        static let slowInputCharactersCount = 1
+        static let baseTypingSpeed: Int32 = 12 // Optimal balance between speed and reliability
+        static let interKeyDelay: UInt64 = 15_000_000 // 15ms between key presses
+        static let initialStabilizationDelay: UInt64 = 100_000_000 // 100ms after first character
     }
     
     static func inputText(_ text: String) async throws {
-        // due to different keyboard input listener events (i.e. autocorrection or hardware keyboard connection)
-        // characters after the first on are often skipped, so we'll input it with lower typing frequency
-        let firstCharacter = String(text.prefix(Constants.slowInputCharactersCount))
-        logger.info("first character: \(firstCharacter)")
+        guard !text.isEmpty else { return }
+        
+        // Split into individual characters for atomic handling
+        let characters = Array(text)
+        
+        // Type first character with stabilization delay
+        try await typeCharacter(String(characters[0]), initialDelay: true)
+        
+        // Process remaining characters
+        for character in characters[1...] {
+            try await Task.sleep(nanoseconds: Constants.interKeyDelay)
+            try await typeCharacter(String(character))
+        }
+    }
+    
+    private static func typeCharacter(_ character: String, initialDelay: Bool = false) async throws {
+        logger.info("Typing character: \(character)")
+        
         var eventPath = PointerEventPath.pathForTextInput()
-        eventPath.type(text: firstCharacter, typingSpeed: 1)
+        eventPath.type(text: character, typingSpeed: Constants.baseTypingSpeed)
+        
         let eventRecord = EventRecord(orientation: .portrait)
         _ = eventRecord.add(eventPath)
+        
         try await RunnerDaemonProxy().synthesize(eventRecord: eventRecord)
         
-        // wait 500 ms before dispatching next input text request to avoid iOS dropping characters
-        try await Task.sleep(nanoseconds: UInt64(1_000_000_000 * 0.5))
-        
-        if (text.count > Constants.slowInputCharactersCount) {
-            let remainingText = String(text.suffix(text.count - Constants.slowInputCharactersCount))
-            logger.info("remaining text: \(remainingText)")
-            var eventPath2 = PointerEventPath.pathForTextInput()
-            eventPath2.type(text: remainingText, typingSpeed: Constants.typingFrequency)
-            let eventRecord2 = EventRecord(orientation: .portrait)
-            _ = eventRecord2.add(eventPath2)
-            try await RunnerDaemonProxy().synthesize(eventRecord: eventRecord2)
+        if initialDelay {
+            // Slightly longer delay after first character to stabilize input
+            try await Task.sleep(nanoseconds: Constants.initialStabilizationDelay)
         }
     }
 }
