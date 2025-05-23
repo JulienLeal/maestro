@@ -9,10 +9,20 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.logging.Logger
+
+data class TimerInfo(val scheduledTimeMillis: Long, val future: ScheduledFuture<*>)
 
 class GraalJsTimer {
+
+    companion object {
+        private const val MAX_WAIT_FOR_TIMERS_TIMEOUT_MS = 60_000L
+        private const val MAX_TIMER_AGE_MS = 30_000L
+        private val LOGGER = Logger.getLogger(GraalJsTimer::class.java.name)
+    }
+
     private val scheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
-    private val timeouts = ConcurrentHashMap<Int, ScheduledFuture<*>>()
+    private val timeouts = ConcurrentHashMap<Int, TimerInfo>()
     private var timeoutCounter = 0
     private var activeTimersCount = AtomicInteger(0)
     private var activeTimers = CountDownLatch(0)
@@ -51,23 +61,51 @@ class GraalJsTimer {
                 }
             }
         }, delay, TimeUnit.MILLISECONDS)
-        
-        timeouts[timeoutId] = future
+
+        timeouts[timeoutId] = TimerInfo(System.currentTimeMillis(), future)
         return timeoutId
     }
 
     private fun clearTimeout(timeoutId: Int) {
-        timeouts.remove(timeoutId)?.let { future ->
-            future.cancel(false)
+        timeouts.remove(timeoutId)?.let { timerInfo ->
+            timerInfo.future.cancel(false)
             if (activeTimersCount.decrementAndGet() == 0) {
                 activeTimers.countDown()
             }
         }
     }
 
+    fun cancelOverdueTimers(maxTimerAgeMillis: Long) {
+        val currentTime = System.currentTimeMillis()
+        timeouts.forEach { (timeoutId, timerInfo) ->
+            if (currentTime - timerInfo.scheduledTimeMillis > maxTimerAgeMillis) {
+                if (timerInfo.future.cancel(false)) {
+                    timeouts.remove(timeoutId)
+                    if (activeTimersCount.decrementAndGet() == 0) {
+                        activeTimers.countDown()
+                    }
+                    val overdueTime = currentTime - timerInfo.scheduledTimeMillis - maxTimerAgeMillis
+                    LOGGER.warning("Cancelled overdue timer (ID: $timeoutId) which was ${overdueTime}ms over the max age limit.")
+                }
+            }
+        }
+    }
+
     fun waitForActiveTimers(timeout: Long = 30_000) {
         if (activeTimersCount.get() > 0) {
-            activeTimers.await(timeout, TimeUnit.MILLISECONDS)
+            cancelOverdueTimers(MAX_TIMER_AGE_MS)
+            val waitTime = if (timeout > MAX_WAIT_FOR_TIMERS_TIMEOUT_MS) {
+                MAX_WAIT_FOR_TIMERS_TIMEOUT_MS
+            } else {
+                timeout
+            }
+            val success = activeTimers.await(waitTime, TimeUnit.MILLISECONDS)
+            if (!success && activeTimersCount.get() > 0) {
+                // It's possible that cancelOverdueTimers cleared all timers already
+                if (activeTimersCount.get() > 0) {
+                    LOGGER.warning("waitForActiveTimers timed out after ${waitTime}ms, ${activeTimersCount.get()} timers are still active.")
+                }
+            }
         }
     }
 
